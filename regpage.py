@@ -34,11 +34,19 @@ def save_line(filepath: str, content: str):
             f.write(content.strip() + "\n")
 
 
+def decode_unicode_text(text: str) -> str:
+    """Giải mã toàn bộ chuỗi \\uXXXX bị lồng nhiều lớp trong Bloks sang tiếng Việt có dấu"""
+    if not text:
+        return ""
+    decoded = re.sub(r'\\+u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
+    return decoded.replace('\\"', '"').replace("\\'", "'").replace("\\\\", "").strip("\\")
+
+
 class FacebookAllInOne:
     def __init__(self, proxy: str = None):
         self.session = requests.Session()
         if proxy and proxy.strip():
-            proxy = proxy.strip()
+            proxy = proxy.strip().strip('"').strip("'")
             # Hỗ trợ định dạng ip:port:user:pass hoặc user:pass@ip:port
             if not proxy.startswith("http"):
                 parts = proxy.split(":")
@@ -288,7 +296,7 @@ class FacebookAllInOne:
             return []
 
     def reg_page(self, page_name: str = None, category_id: str = "180164648685982"):
-        """Gọi API GraphQL Bloks tạo Page Profile Plus (Chuẩn 100% từ mã nguồn Smali)"""
+        """Gọi API GraphQL Bloks tạo Page Profile Plus"""
         if not page_name:
             page_name = self.random_page_name()
 
@@ -375,7 +383,7 @@ class FacebookAllInOne:
 
             if "error" in res_json or "errors" in res_json:
                 err_msg = res_json.get("error", {}).get("message") or str(res_json.get("errors"))
-                return False, f"Lỗi GraphQL: {err_msg}"
+                return False, f"Lỗi GraphQL: {decode_unicode_text(err_msg)}"
 
             # Chờ 2.5s để đồng bộ danh sách Page mới
             time.sleep(2.5)
@@ -385,7 +393,7 @@ class FacebookAllInOne:
                 if page["id"] not in before_pages:
                     return True, page
 
-            # Bóc tách trực tiếp Page ID trong gói Bloks nếu API /me/accounts chưa kịp cập nhật
+            # Bóc tách trực tiếp Page ID hoặc thông báo lỗi tiếng Việt trong gói Bloks
             if "bloks_bundle_action" in res_text:
                 ids = re.findall(r'\b(615\d{11,13}|1000\d{10,12}|\d{14,16})\b', res_text)
                 ignore_ids = {"180164648685982", "55098533200051", str(self.uid)}
@@ -393,29 +401,71 @@ class FacebookAllInOne:
                 if extracted:
                     return True, {"id": extracted[0], "name": page_name, "access_token": ""}
 
-                # Giải mã thông báo lỗi tiếng Việt ẩn trong chuỗi Unicode của Bloks (nếu bị chặn)
-                try:
-                    decoded_bloks = res_json["data"]["fb_bloks_action"]["root_action"]["action"]["action_bundle"]["bloks_bundle_action"]
-                    err_matches = re.findall(r'"([^"]*?(?:không thể|giới hạn|tên|Trang|thử lại|vi phạm)[^"]*?)"', decoded_bloks, re.IGNORECASE)
-                    if err_matches:
-                        return False, f"Facebook từ chối: {err_matches[0]}"
-                except Exception:
-                    pass
+                # Giải mã toàn bộ phản hồi Bloks sang tiếng Việt có dấu
+                readable_text = decode_unicode_text(res_text)
+                err_matches = re.findall(
+                    r'"([^"]*?(?:Không thể|giới hạn|quá nhiều|thử lại|vi phạm|không hợp lệ)[^"]*?)"',
+                    readable_text,
+                    re.IGNORECASE
+                )
+                if err_matches:
+                    return False, f"Facebook từ chối: {err_matches[0]}"
 
-            return False, "Tài khoản đã chạm giới hạn tạo Page trong ngày hoặc cần dùng Token gốc của App Android (EAAAAU)"
+            return False, "Tài khoản đã chạm giới hạn tạo Page trong ngày hoặc IP mạng đang bị chặn tạm thời"
 
         except Exception as e:
             return False, f"Lỗi kết nối Reg Page: {e}"
 
-    def upload_page_avatar(self, page_access_token: str, image_url: str) -> bool:
-        if not page_access_token or not image_url:
+    def upload_page_avatar(self, page_access_token: str, path_or_url: str) -> bool:
+        """Hỗ trợ up Avatar từ: Thư mục ảnh trong máy, File ảnh lẻ trong máy, hoặc Link ảnh Online"""
+        if not page_access_token or not path_or_url:
             return False
+
+        clean_path = path_or_url.strip().strip('"').strip("'")
+        if not clean_path:
+            return False
+
         url = "https://graph.facebook.com/me/picture"
-        data = {"url": image_url, "access_token": page_access_token}
+
         try:
-            res = self.session.post(url, data=data, headers={"User-Agent": self.user_agent}, timeout=20)
-            return res.status_code == 200 and "error" not in res.json()
-        except Exception:
+            # 1. Nếu là đường dẫn Thư mục (VD: D:\New folder\avatars) -> Chọn ngẫu nhiên 1 ảnh
+            if os.path.isdir(clean_path):
+                imgs = [
+                    os.path.join(clean_path, f) for f in os.listdir(clean_path)
+                    if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+                ]
+                if not imgs:
+                    safe_print(f"   [!] Không tìm thấy file ảnh (.jpg, .png) nào trong thư mục: {clean_path}")
+                    return False
+                clean_path = random.choice(imgs)
+
+            # 2. Nếu là đường dẫn File ảnh trên máy tính -> Upload file trực tiếp
+            if os.path.isfile(clean_path):
+                with open(clean_path, "rb") as img_file:
+                    res = self.session.post(
+                        url,
+                        data={"access_token": page_access_token},
+                        files={"source": img_file},
+                        headers={"User-Agent": self.user_agent},
+                        timeout=30
+                    )
+                return res.status_code == 200 and "error" not in res.json()
+
+            # 3. Nếu là Link ảnh trên mạng (http / https)
+            if clean_path.startswith("http://") or clean_path.startswith("https://"):
+                res = self.session.post(
+                    url,
+                    data={"url": clean_path, "access_token": page_access_token},
+                    headers={"User-Agent": self.user_agent},
+                    timeout=20
+                )
+                return res.status_code == 200 and "error" not in res.json()
+
+            safe_print(f"   [!] Đường dẫn ảnh hoặc thư mục không tồn tại: {clean_path}")
+            return False
+
+        except Exception as e:
+            safe_print(f"   [-] Lỗi khi up Avatar: {e}")
             return False
 
 
@@ -499,8 +549,8 @@ def worker_task(index: int, line: str, config: dict):
             p_token = page_info.get("access_token", "")
             safe_print(f"[Luồng {index}] [SUCCESS] Tạo thành công: {p_real_name} | ID: {p_id}")
 
-            if config.get("AVATAR_URL") and p_token:
-                if bot.upload_page_avatar(p_token, config["AVATAR_URL"]):
+            if config.get("AVATAR_PATH") and p_token:
+                if bot.upload_page_avatar(p_token, config["AVATAR_PATH"]):
                     safe_print(f"[Luồng {index}] [+] Đã cập nhật Avatar cho Page {p_id}")
 
             save_line(SUCCESS_FILE, f"{bot.uid}|{p_id}|{p_real_name}|{p_token}|{bot.access_token}")
@@ -517,11 +567,11 @@ def worker_task(index: int, line: str, config: dict):
 # =========================================================================
 def run_interactive_mode():
     while True:
-        print("\n" + "=" * 65)
+        print("\n" + "=" * 68)
         print("   CHẾ ĐỘ 1: NHẬP TRỰC TIẾP TOKEN / COOKIE / TÀI KHOẢN")
-        print("=" * 65)
-        raw_token = input("[1] Nhập Access Token (Nhấn Enter để bỏ qua nếu dùng Cookie)  : ").strip()
-        raw_cookie = input("[2] Nhập Cookie (Nhấn Enter để bỏ qua nếu đã nhập Token)      : ").strip()
+        print("=" * 68)
+        raw_token = input("[1] Nhập Access Token (Nhấn Enter để bỏ qua nếu dùng Cookie)     : ").strip()
+        raw_cookie = input("[2] Nhập Cookie (Nhấn Enter để bỏ qua nếu đã nhập Token)         : ").strip()
 
         raw_uid, raw_pass, raw_2fa = "", "", ""
         if not raw_token and not raw_cookie:
@@ -533,17 +583,17 @@ def run_interactive_mode():
                 print("[-] Bạn phải nhập ít nhất Token, Cookie hoặc UID/Pass!")
                 continue
 
-        raw_proxy = input("[3] Nhập Proxy ip:port:user:pass (Nhấn Enter nếu không dùng)  : ").strip()
-        so_luong_str = input("[4] Số lượng Page muốn tạo (Mặc định = 5)                     : ").strip()
+        raw_proxy = input("[3] Nhập Proxy ip:port:user:pass (Nhấn Enter nếu không dùng)     : ").strip()
+        so_luong_str = input("[4] Số lượng Page muốn tạo (Mặc định = 5)                        : ").strip()
         so_luong = int(so_luong_str) if so_luong_str.isdigit() else 5
 
-        delay_str = input("[5] Thời gian nghỉ giữa mỗi lần tạo - giây (Mặc định = 10)    : ").strip()
+        delay_str = input("[5] Thời gian nghỉ giữa mỗi lần tạo - giây (Mặc định = 10)       : ").strip()
         delay_sec = int(delay_str) if delay_str.isdigit() else 10
 
-        custom_name = input("[6] Tên Page muốn đặt (Nhấn Enter để tự random tên Việt)      : ").strip()
-        avatar_url = input("[7] Link ảnh Avatar muốn up cho Page (Nhấn Enter để bỏ qua)   : ").strip()
+        custom_name = input("[6] Tên Page muốn đặt (Nhấn Enter để tự random tên Việt)         : ").strip()
+        avatar_path = input("[7] Thư mục ảnh / File ảnh / Link ảnh Avatar (Enter để bỏ qua)   : ").strip()
 
-        print("\n" + "-" * 65)
+        print("\n" + "-" * 68)
         bot = FacebookAllInOne(proxy=raw_proxy)
         is_live = False
         name_or_err = ""
@@ -592,8 +642,9 @@ def run_interactive_mode():
                     if p_token:
                         print(f"   -> Token Page: {p_token[:40]}...")
 
-                    if avatar_url and p_token:
-                        if bot.upload_page_avatar(p_token, avatar_url):
+                    if avatar_path and p_token:
+                        print("   [*] Đang tải ảnh Avatar lên Page...")
+                        if bot.upload_page_avatar(p_token, avatar_path):
                             print("   -> Đã cập nhật Avatar thành công!")
 
                     save_line(SUCCESS_FILE, f"{bot.uid}|{p_id}|{p_real_name}|{p_token}|{bot.access_token}")
@@ -612,9 +663,9 @@ def run_interactive_mode():
 
 
 def run_batch_file_mode():
-    print("\n" + "=" * 65)
+    print("\n" + "=" * 68)
     print("   CHẾ ĐỘ 2: CHẠY ĐA LUỒNG TỪ FILE ACCOUNTS.TXT")
-    print("=" * 65)
+    print("=" * 68)
 
     if not os.path.exists(ACCOUNTS_FILE):
         with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
@@ -631,17 +682,18 @@ def run_batch_file_mode():
         return
 
     print(f"[+] Đã tìm thấy {len(lines)} tài khoản trong file accounts.txt.")
-    threads_str = input("[1] Nhập số luồng chạy cùng lúc (Mặc định = 3)         : ").strip()
-    pages_str = input("[2] Số lượng Page muốn tạo mỗi acc (Mặc định = 4)      : ").strip()
-    delay_str = input("[3] Thời gian nghỉ giữa mỗi lần tạo - giây (Mặc định = 10): ").strip()
-    avatar_url = input("[4] Link ảnh Avatar (Nhấn Enter nếu không up Avatar)   : ").strip()
+    threads_str = input("[1] Nhập số luồng chạy cùng lúc (Mặc định = 3)                   : ").strip()
+    pages_str = input("[2] Số lượng Page muốn tạo mỗi acc (Mặc định = 4)                : ").strip()
+    delay_str = input("[3] Thời gian nghỉ giữa mỗi lần tạo - giây (Mặc định = 10)       : ").strip()
+    avatar_path = input("[4] Thư mục ảnh / File ảnh / Link ảnh Avatar (Enter để bỏ qua)   : ").strip()
+    default_proxy = input("[5] Proxy dùng chung ip:port:user:pass (Enter nếu không dùng)    : ").strip()
 
     config = {
         "MAX_THREADS": int(threads_str) if threads_str.isdigit() else 3,
         "PAGES_PER_ACC": int(pages_str) if pages_str.isdigit() else 4,
         "DELAY_SEC": int(delay_str) if delay_str.isdigit() else 10,
-        "AVATAR_URL": avatar_url if avatar_url else None,
-        "DEFAULT_PROXY": None
+        "AVATAR_PATH": avatar_path if avatar_path else None,
+        "DEFAULT_PROXY": default_proxy if default_proxy else None
     }
 
     print(f"\n[*] Đang khởi chạy {config['MAX_THREADS']} luồng...\n")
@@ -659,12 +711,12 @@ def run_batch_file_mode():
 
 def main():
     os.system("cls" if os.name == "nt" else "clear")
-    print("=" * 65)
+    print("=" * 68)
     print("      TOOL REG PAGE PROFILE PLUS FULL API (TOKEN / COOKIE)")
-    print("=" * 65)
+    print("=" * 68)
     print("  [1] Nhập trực tiếp Token / Cookie trên màn hình CMD (Chạy lẻ)")
     print("  [2] Chạy hàng loạt đa luồng từ file accounts.txt")
-    print("=" * 65)
+    print("=" * 68)
 
     choice = input("-> Chọn chế độ chạy (1 hoặc 2, mặc định là 1): ").strip()
     if choice == "2":
