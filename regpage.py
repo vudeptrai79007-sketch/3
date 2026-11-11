@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import time
 import uuid
@@ -12,9 +13,14 @@ import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Khóa đồng bộ khi in log và ghi file đa luồng
+# Khóa đồng bộ khi chạy đa luồng
 print_lock = threading.Lock()
 file_lock = threading.Lock()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SUCCESS_FILE = os.path.join(BASE_DIR, "success_pages.txt")
+FAILED_FILE = os.path.join(BASE_DIR, "failed_accounts.txt")
+ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.txt")
 
 
 def safe_print(msg: str):
@@ -22,19 +28,24 @@ def safe_print(msg: str):
         print(msg)
 
 
-def save_line(filename: str, content: str):
+def save_line(filepath: str, content: str):
     with file_lock:
-        with open(filename, "a", encoding="utf-8") as f:
+        with open(filepath, "a", encoding="utf-8") as f:
             f.write(content.strip() + "\n")
 
 
 class FacebookAllInOne:
     def __init__(self, proxy: str = None):
         self.session = requests.Session()
-        if proxy:
+        if proxy and proxy.strip():
             proxy = proxy.strip()
+            # Hỗ trợ định dạng ip:port:user:pass hoặc user:pass@ip:port
             if not proxy.startswith("http"):
-                proxy = f"http://{proxy}"
+                parts = proxy.split(":")
+                if len(parts) == 4 and "@" not in proxy:
+                    proxy = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+                else:
+                    proxy = f"http://{proxy}"
             self.session.proxies = {"http": proxy, "https": proxy}
 
         self.fb4a_app_id = "350685531728"
@@ -55,7 +66,7 @@ class FacebookAllInOne:
         ho = ["Nguyễn", "Trần", "Lê", "Phạm", "Hoàng", "Huỳnh", "Phan", "Vũ", "Võ", "Đặng", "Bùi", "Đỗ", "Hồ", "Ngô", "Dương", "Lý"]
         dem = ["Văn", "Thị", "Minh", "Hoàng", "Ngọc", "Thanh", "Quốc", "Gia", "Bảo", "Đức", "Phương", "Anh", "Tuấn", "Hải"]
         ten = ["Anh", "Bình", "Châu", "Dũng", "Giang", "Hà", "Hải", "Hiếu", "Hòa", "Hùng", "Hương", "Huyền", "Khánh", "Khoa", "Linh", "Long", "Mai", "Minh", "My", "Nam", "Ngọc", "Nhung", "Phúc", "Phương", "Quân", "Quang", "Quỳnh", "Sơn", "Tâm", "Thảo", "Thắng", "Thành", "Thịnh", "Thu", "Trang", "Trung", "Tú", "Tuấn", "Tùng", "Uyên", "Việt", "Vinh", "Vy", "Yến"]
-        suffix = ["Official", "Vlog", "Blog", "Store", "Shop", "Media", "Daily", "News", "24h", "TV"]
+        suffix = ["Official", "Vlog", "Blog", "Store", "Shop", "Media", "Daily", "News", "24h", "TV", "Channel", "Studio"]
 
         if random.choice([True, False]):
             return f"{random.choice(ho)} {random.choice(dem)} {random.choice(ten)}"
@@ -63,7 +74,7 @@ class FacebookAllInOne:
 
     @staticmethod
     def get_totp_2fa(secret_key: str) -> str:
-        """Tự giải mã 6 số 2FA từ chuỗi Secret Key"""
+        """Giải mã 6 số 2FA từ Secret Key"""
         clean_key = secret_key.replace(" ", "").strip().upper()
         padding = len(clean_key) % 8
         if padding != 0:
@@ -81,7 +92,86 @@ class FacebookAllInOne:
         return "; ".join([f"{c['name']}={c['value']}" for c in cookies_list if "name" in c and "value" in c])
 
     # =========================================================================
-    # 1. LẤY TOKEN EAAAAU TỪ UID | PASS | 2FA
+    # 1. CHUYỂN ĐỔI MỌI LOẠI TOKEN SANG EAAAAU (APP ANDROID KATANA)
+    # =========================================================================
+    def convert_token_to_eaaau(self, token: str) -> str:
+        token = token.strip()
+        if token.startswith("EAAAAU") or token.startswith("EAAAAAY"):
+            return token
+        try:
+            res = self.session.get(
+                "https://api.facebook.com/method/auth.getSessionforApp",
+                params={
+                    "access_token": token,
+                    "format": "json",
+                    "new_app_id": self.fb4a_app_id,
+                    "generate_session_cookies": "1"
+                },
+                headers={"User-Agent": self.user_agent},
+                timeout=20
+            ).json()
+            if "access_token" in res:
+                return res["access_token"]
+        except Exception:
+            pass
+        return token
+
+    # =========================================================================
+    # 2. LẤY TOKEN TỪ COOKIE (TÍCH HỢP 3 CỔNG DỰ PHÒNG)
+    # =========================================================================
+    def login_with_cookie(self, cookie: str):
+        self.cookie = cookie.strip()
+        web_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Cookie": self.cookie,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Mode": "navigate"
+        }
+
+        try:
+            base_token = None
+
+            # Cổng 1: Lấy EAAG từ Business Locations
+            res1 = self.session.get("https://business.facebook.com/business_locations", headers=web_headers, timeout=20)
+            match1 = re.search(r'(EAAG\w+)', res1.text)
+            if match1:
+                base_token = match1.group(1)
+
+            # Cổng 2: Lấy EAAB / EAAA từ Ads Manager
+            if not base_token:
+                res2 = self.session.get("https://adsmanager.facebook.com/adsmanager/manage/campaigns", headers=web_headers, timeout=20)
+                match2 = re.search(r'(EAA[a-zA-Z0-9]{50,})', res2.text)
+                if match2:
+                    base_token = match2.group(1)
+                else:
+                    act_match = re.search(r'act=(\d+)', res2.text) or re.search(r'act=(\d+)', res2.url)
+                    if act_match:
+                        url_act = f"https://adsmanager.facebook.com/adsmanager/manage/campaigns?act={act_match.group(1)}"
+                        res_act = self.session.get(url_act, headers=web_headers, timeout=20)
+                        match_eaa = re.search(r'(EAA[a-zA-Z0-9]{50,})', res_act.text)
+                        if match_eaa:
+                            base_token = match_eaa.group(1)
+
+            # Cổng 3: Lấy EAAA từ Composer Ocelot
+            if not base_token:
+                res3 = self.session.get("https://www.facebook.com/composer/ocelot/async_loader/?publisher=feed", headers=web_headers, timeout=20)
+                match3 = re.search(r'(EAA[a-zA-Z0-9]{50,})', res3.text)
+                if match3:
+                    base_token = match3.group(1)
+
+            if not base_token:
+                return False, "Cookie Die hoặc không trích xuất được Token từ Cookie!"
+
+            # Đổi Token trung gian sang EAAAAU của Android
+            self.access_token = self.convert_token_to_eaaau(base_token)
+            return True, f"Lấy Token thành công ({self.access_token[:15]}...)"
+
+        except Exception as e:
+            return False, f"Lỗi kết nối khi xử lý Cookie: {e}"
+
+    # =========================================================================
+    # 3. ĐĂNG NHẬP TỪ UID | PASS | 2FA
     # =========================================================================
     def login_with_account(self, uid: str, password: str, twofa_secret: str = None):
         url = "https://b-graph.facebook.com/auth/login"
@@ -128,17 +218,16 @@ class FacebookAllInOne:
             if "access_token" in res_json:
                 self.access_token = res_json["access_token"]
                 self.cookie = self._parse_session_cookies(res_json.get("session_cookies", []))
-                return True, "Login thành công"
+                return True, "Đăng nhập thành công"
 
             error = res_json.get("error", {})
             error_data = error.get("error_data", {})
             if isinstance(error_data, str):
                 error_data = json.loads(error_data)
 
-            # Xử lý xác thực 2 yếu tố (2FA)
             if error.get("code") == 406 or "login_first_factor" in error_data:
                 if not twofa_secret:
-                    return False, "Tài khoản có 2FA nhưng thiếu mã 2FA Secret"
+                    return False, "Tài khoản yêu cầu 2FA nhưng chưa nhập mã 2FA"
 
                 otp_code = self.get_totp_2fa(twofa_secret) if len(twofa_secret.strip()) > 6 else twofa_secret.strip()
                 first_factor = error_data.get("login_first_factor")
@@ -160,71 +249,17 @@ class FacebookAllInOne:
                 if "access_token" in res_2fa_json:
                     self.access_token = res_2fa_json["access_token"]
                     self.cookie = self._parse_session_cookies(res_2fa_json.get("session_cookies", []))
-                    return True, "Login 2FA thành công"
+                    return True, "Đăng nhập 2FA thành công"
 
                 return False, res_2fa_json.get("error", {}).get("message", "Lỗi xác thực 2FA")
 
             return False, error.get("message", str(res_json))
 
         except Exception as e:
-            return False, f"Lỗi kết nối khi Login: {e}"
+            return False, f"Lỗi kết nối Login: {e}"
 
     # =========================================================================
-    # 2. LẤY TOKEN EAAAAU TỪ COOKIE
-    # =========================================================================
-    def login_with_cookie(self, cookie: str):
-        self.cookie = cookie.strip()
-        web_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Cookie": self.cookie,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "navigate"
-        }
-
-        try:
-            base_token = None
-            res = self.session.get("https://business.facebook.com/business_locations", headers=web_headers, timeout=20)
-            match_eaag = re.search(r'(EAAG\w+)', res.text)
-            if match_eaag:
-                base_token = match_eaag.group(1)
-
-            if not base_token:
-                res_ads = self.session.get("https://adsmanager.facebook.com/adsmanager/manage/campaigns", headers=web_headers, timeout=20)
-                act_match = re.search(r'act=(\d+)', res_ads.text) or re.search(r'act=(\d+)', res_ads.url)
-                if act_match:
-                    url_act = f"https://adsmanager.facebook.com/adsmanager/manage/campaigns?act={act_match.group(1)}"
-                    res_act = self.session.get(url_act, headers=web_headers, timeout=20)
-                    match_eaa = re.search(r'(EAA[a-zA-Z0-9]+)', res_act.text)
-                    if match_eaa:
-                        base_token = match_eaa.group(1)
-
-            if not base_token:
-                return False, "Cookie Die hoặc không lấy được Token trung gian"
-
-            # Đổi sang Token EAAAAU của App Android
-            convert_url = "https://api.facebook.com/method/auth.getSessionforApp"
-            params = {
-                "access_token": base_token,
-                "format": "json",
-                "new_app_id": self.fb4a_app_id,
-                "generate_session_cookies": "1"
-            }
-            res_conv = self.session.get(convert_url, params=params, headers={"User-Agent": self.user_agent}, timeout=20)
-            conv_json = res_conv.json()
-
-            if "access_token" in conv_json:
-                self.access_token = conv_json["access_token"]
-                return True, "Đổi Cookie sang EAAAAU thành công"
-
-            self.access_token = base_token
-            return True, "Dùng Token gốc từ Cookie (không đổi được sang EAAAAU)"
-
-        except Exception as e:
-            return False, f"Lỗi xử lý Cookie: {e}"
-
-    # =========================================================================
-    # 3. CÁC API FACEBOOK (CHECK TOKEN, GET PAGES, REG PAGE, UP AVATAR)
+    # 4. API CHECK TOKEN, LẤY DANH SÁCH PAGE, REG PAGE & UP AVATAR
     # =========================================================================
     def check_token(self):
         url = "https://graph.facebook.com/me"
@@ -253,6 +288,7 @@ class FacebookAllInOne:
             return []
 
     def reg_page(self, page_name: str = None, category_id: str = "180164648685982"):
+        """Gọi API GraphQL Bloks tạo Page Profile Plus (Chuẩn 100% từ mã nguồn Smali)"""
         if not page_name:
             page_name = self.random_page_name()
 
@@ -341,6 +377,7 @@ class FacebookAllInOne:
                 err_msg = res_json.get("error", {}).get("message") or str(res_json.get("errors"))
                 return False, f"Lỗi GraphQL: {err_msg}"
 
+            # Chờ 2.5s để đồng bộ danh sách Page mới
             time.sleep(2.5)
             after_pages = self.get_my_pages()
 
@@ -348,7 +385,7 @@ class FacebookAllInOne:
                 if page["id"] not in before_pages:
                     return True, page
 
-            # Dự phòng bóc ID trực tiếp từ Bloks bundle nếu API /me/accounts cập nhật chậm
+            # Bóc tách trực tiếp Page ID trong gói Bloks nếu API /me/accounts chưa kịp cập nhật
             if "bloks_bundle_action" in res_text:
                 ids = re.findall(r'\b(615\d{11,13}|1000\d{10,12}|\d{14,16})\b', res_text)
                 ignore_ids = {"180164648685982", "55098533200051", str(self.uid)}
@@ -356,7 +393,16 @@ class FacebookAllInOne:
                 if extracted:
                     return True, {"id": extracted[0], "name": page_name, "access_token": ""}
 
-            return False, "Không thấy Page mới (Tài khoản bị giới hạn tạo Page hoặc tên bị từ chối)"
+                # Giải mã thông báo lỗi tiếng Việt ẩn trong chuỗi Unicode của Bloks (nếu bị chặn)
+                try:
+                    decoded_bloks = res_json["data"]["fb_bloks_action"]["root_action"]["action"]["action_bundle"]["bloks_bundle_action"]
+                    err_matches = re.findall(r'"([^"]*?(?:không thể|giới hạn|tên|Trang|thử lại|vi phạm)[^"]*?)"', decoded_bloks, re.IGNORECASE)
+                    if err_matches:
+                        return False, f"Facebook từ chối: {err_matches[0]}"
+                except Exception:
+                    pass
+
+            return False, "Tài khoản đã chạm giới hạn tạo Page trong ngày hoặc cần dùng Token gốc của App Android (EAAAAU)"
 
         except Exception as e:
             return False, f"Lỗi kết nối Reg Page: {e}"
@@ -374,41 +420,34 @@ class FacebookAllInOne:
 
 
 # =========================================================================
-# HÀM PHÂN TÍCH DÒNG TÀI KHOẢN & LUỒNG WORKER
+# HỖ TRỢ ĐỌC DÒNG TÀI KHOẢN & CHẠY ĐA LUỒNG
 # =========================================================================
 def parse_account_line(line: str) -> dict:
-    """
-    Tự động nhận diện các định dạng:
-    1. EAAAAU... (hoặc EAAAAU...|proxy)
-    2. c_user=...; xs=... (hoặc cookie|proxy)
-    3. UID|PASS|2FA (hoặc UID|PASS|2FA|COOKIE|PROXY)
-    """
     parts = [p.strip() for p in line.strip().split("|") if p.strip()]
     result = {"type": None, "token": None, "cookie": None, "uid": None, "pass": None, "twofa": None, "proxy": None}
-
     if not parts:
         return result
 
-    # Kiểm tra nếu cột cuối cùng là Proxy (chứa dấu : và không phải cookie)
-    if len(parts) > 1 and ":" in parts[-1] and "c_user=" not in parts[-1] and not parts[-1].startswith("EAA"):
-        result["proxy"] = parts.pop(-1)
+    remaining = []
+    for p in parts:
+        if p.startswith("EAA"):
+            result["token"] = p
+        elif "c_user=" in p and "xs=" in p:
+            result["cookie"] = p
+        elif (":" in p and not p.startswith("http") and len(p.split(":")) in (2, 4)) or p.startswith("http://") or p.startswith("https://"):
+            result["proxy"] = p
+        else:
+            remaining.append(p)
 
-    first = parts[0]
-    if first.startswith("EAA"):
-        result["type"] = "TOKEN"
-        result["token"] = first
-    elif "c_user=" in first and "xs=" in first:
-        result["type"] = "COOKIE"
-        result["cookie"] = first
-    elif len(parts) >= 2:
+    if result["token"] or result["cookie"]:
+        result["type"] = "TOKEN_OR_COOKIE"
+    elif len(remaining) >= 2:
         result["type"] = "ACCOUNT"
-        result["uid"] = parts[0]
-        result["pass"] = parts[1]
-        for item in parts[2:]:
-            if "c_user=" in item:
-                result["cookie"] = item
-            else:
-                result["twofa"] = item
+        result["uid"] = remaining[0]
+        result["pass"] = remaining[1]
+        if len(remaining) >= 3:
+            result["twofa"] = remaining[2]
+
     return result
 
 
@@ -420,109 +459,223 @@ def worker_task(index: int, line: str, config: dict):
 
     proxy = parsed["proxy"] or config.get("DEFAULT_PROXY")
     bot = FacebookAllInOne(proxy=proxy)
+    is_live = False
+    name_or_err = ""
 
-    # Bước 1: Lấy Access Token theo định dạng đầu vào
-    if parsed["type"] == "TOKEN":
-        bot.access_token = parsed["token"]
-    elif parsed["type"] == "COOKIE":
-        safe_print(f"[Luồng {index}] Đang lấy Token EAAAAU từ Cookie...")
-        ok, msg = bot.login_with_cookie(parsed["cookie"])
-        if not ok:
-            safe_print(f"[Luồng {index}] [-] Thất bại: {msg}")
-            save_line("failed_accounts.txt", f"{line} | {msg}")
-            return
+    if parsed["type"] == "TOKEN_OR_COOKIE":
+        if parsed["token"]:
+            bot.access_token = bot.convert_token_to_eaaau(parsed["token"])
+            is_live, name_or_err = bot.check_token()
+        if not is_live and parsed["cookie"]:
+            safe_print(f"[Luồng {index}] Đang lấy Token từ Cookie...")
+            ok, msg = bot.login_with_cookie(parsed["cookie"])
+            if ok:
+                is_live, name_or_err = bot.check_token()
+            else:
+                name_or_err = msg
     elif parsed["type"] == "ACCOUNT":
         safe_print(f"[Luồng {index}] Đang đăng nhập UID: {parsed['uid']}...")
         ok, msg = bot.login_with_account(parsed["uid"], parsed["pass"], parsed["twofa"])
-        if not ok and parsed["cookie"]:
-            safe_print(f"[Luồng {index}] Login Pass lỗi ({msg}), chuyển sang thử bằng Cookie...")
-            ok, msg = bot.login_with_cookie(parsed["cookie"])
-        if not ok:
-            safe_print(f"[Luồng {index}] [-] Đăng nhập thất bại ({parsed['uid']}): {msg}")
-            save_line("failed_accounts.txt", f"{line} | {msg}")
-            return
+        if ok:
+            is_live, name_or_err = bot.check_token()
+        else:
+            name_or_err = msg
 
-    # Bước 2: Kiểm tra Token Live
-    is_live, name_or_err = bot.check_token()
     if not is_live:
-        safe_print(f"[Luồng {index}] [-] Token Die: {name_or_err}")
-        save_line("failed_accounts.txt", f"{line} | Token Die: {name_or_err}")
+        safe_print(f"[Luồng {index}] [-] Đăng nhập thất bại: {name_or_err}")
+        save_line(FAILED_FILE, f"{line} | {name_or_err}")
         return
 
-    safe_print(f"[Luồng {index}] [+] Via Live | UID: {bot.uid} ({name_or_err}) -> Bắt đầu Reg {config['PAGES_PER_ACC']} Page...")
+    safe_print(f"[Luồng {index}] [+] Via Live | UID: {bot.uid} ({name_or_err}) -> Bắt đầu tạo {config['PAGES_PER_ACC']} Page...")
 
-    # Bước 3: Tiến hành Reg Page theo số lượng cấu hình
     for i in range(config["PAGES_PER_ACC"]):
-        page_name = bot.random_page_name()
-        safe_print(f"[Luồng {index}] [*] ({bot.uid}) Đang tạo Page {i + 1}/{config['PAGES_PER_ACC']}: '{page_name}'...")
+        p_name = bot.random_page_name()
+        safe_print(f"[Luồng {index}] [*] ({bot.uid}) Đang tạo Page {i + 1}/{config['PAGES_PER_ACC']}: '{p_name}'...")
+        ok, page_info = bot.reg_page(page_name=p_name)
 
-        ok, page_info = bot.reg_page(page_name=page_name, category_id=config["CATEGORY_ID"])
         if ok and isinstance(page_info, dict):
             p_id = page_info.get("id", "")
-            p_name = page_info.get("name", page_name)
+            p_real_name = page_info.get("name", p_name)
             p_token = page_info.get("access_token", "")
+            safe_print(f"[Luồng {index}] [SUCCESS] Tạo thành công: {p_real_name} | ID: {p_id}")
 
-            safe_print(f"[Luồng {index}] [SUCCESS] Tạo thành công Page: {p_name} | ID: {p_id}")
-
-            # Tự động up Avatar nếu có cấu hình link ảnh và lấy được Token Page
             if config.get("AVATAR_URL") and p_token:
                 if bot.upload_page_avatar(p_token, config["AVATAR_URL"]):
                     safe_print(f"[Luồng {index}] [+] Đã cập nhật Avatar cho Page {p_id}")
 
-            # Lưu kết quả: UID_VIA | PAGE_ID | PAGE_NAME | PAGE_TOKEN | TOKEN_VIA
-            save_line("success_pages.txt", f"{bot.uid}|{p_id}|{p_name}|{p_token}|{bot.access_token}")
+            save_line(SUCCESS_FILE, f"{bot.uid}|{p_id}|{p_real_name}|{p_token}|{bot.access_token}")
         else:
             safe_print(f"[Luồng {index}] [-] ({bot.uid}) Tạo thất bại: {page_info}")
-            # Nếu tài khoản bị chặn/giới hạn tạo Page thì dừng luôn tài khoản đó
             break
 
         if i + 1 < config["PAGES_PER_ACC"]:
-            time.sleep(config["DELAY_BETWEEN_PAGES"])
+            time.sleep(config["DELAY_SEC"])
 
 
-if __name__ == "__main__":
-    # ==================== CẤU HÌNH HỆ THỐNG ====================
-    CONFIG = {
-        "INPUT_FILE": "accounts.txt",
-        "MAX_THREADS": 3,                        # Số luồng chạy song song
-        "PAGES_PER_ACC": 4,                      # Số lượng Page muốn tạo trên mỗi Via
-        "DELAY_BETWEEN_PAGES": 10,               # Nghỉ giữa mỗi lần tạo Page (giây)
-        "CATEGORY_ID": "180164648685982",        # ID Danh mục (180164648685982 = Người sáng tạo nội dung số)
-        "AVATAR_URL": None,                      # Điền link ảnh (VD: "https://i.imgur.com/abc.jpg") hoặc để None
-        "DEFAULT_PROXY": None                    # Proxy mặc định nếu trong file không gắn kèm (VD: "user:pass@ip:port")
-    }
-    # ===========================================================
+# =========================================================================
+# GIAO DIỆN MENU CHÍNH TRÊN CMD
+# =========================================================================
+def run_interactive_mode():
+    while True:
+        print("\n" + "=" * 65)
+        print("   CHẾ ĐỘ 1: NHẬP TRỰC TIẾP TOKEN / COOKIE / TÀI KHOẢN")
+        print("=" * 65)
+        raw_token = input("[1] Nhập Access Token (Nhấn Enter để bỏ qua nếu dùng Cookie)  : ").strip()
+        raw_cookie = input("[2] Nhập Cookie (Nhấn Enter để bỏ qua nếu đã nhập Token)      : ").strip()
 
-    # Tạo file mẫu nếu chưa tồn tại
-    if not os.path.exists(CONFIG["INPUT_FILE"]):
-        with open(CONFIG["INPUT_FILE"], "w", encoding="utf-8") as f:
-            f.write("# Hỗ trợ 3 định dạng (mỗi tài khoản 1 dòng, có thể thêm |proxy ở cuối dòng):\n")
-            f.write("# 1. EAAAAU...\n")
-            f.write("# 2. c_user=1000xxx; xs=xxx;\n")
-            f.write("# 3. 1000xxx|MatKhau|MA_2FA_SECRET\n")
-        print(f"[!] Đã tạo file '{CONFIG['INPUT_FILE']}'. Hãy dán danh sách Via/Token/Cookie vào file rồi chạy lại!")
-        exit(0)
+        raw_uid, raw_pass, raw_2fa = "", "", ""
+        if not raw_token and not raw_cookie:
+            print("[*] Bạn chưa nhập Token/Cookie -> Chuyển sang nhập UID | Pass | 2FA:")
+            raw_uid = input("    -> Nhập UID      : ").strip()
+            raw_pass = input("    -> Nhập Mật khẩu : ").strip()
+            raw_2fa = input("    -> Nhập 2FA Key (Enter nếu không có): ").strip()
+            if not raw_uid or not raw_pass:
+                print("[-] Bạn phải nhập ít nhất Token, Cookie hoặc UID/Pass!")
+                continue
 
-    with open(CONFIG["INPUT_FILE"], "r", encoding="utf-8") as f:
+        raw_proxy = input("[3] Nhập Proxy ip:port:user:pass (Nhấn Enter nếu không dùng)  : ").strip()
+        so_luong_str = input("[4] Số lượng Page muốn tạo (Mặc định = 5)                     : ").strip()
+        so_luong = int(so_luong_str) if so_luong_str.isdigit() else 5
+
+        delay_str = input("[5] Thời gian nghỉ giữa mỗi lần tạo - giây (Mặc định = 10)    : ").strip()
+        delay_sec = int(delay_str) if delay_str.isdigit() else 10
+
+        custom_name = input("[6] Tên Page muốn đặt (Nhấn Enter để tự random tên Việt)      : ").strip()
+        avatar_url = input("[7] Link ảnh Avatar muốn up cho Page (Nhấn Enter để bỏ qua)   : ").strip()
+
+        print("\n" + "-" * 65)
+        bot = FacebookAllInOne(proxy=raw_proxy)
+        is_live = False
+        name_or_err = ""
+
+        if raw_token:
+            bot.access_token = bot.convert_token_to_eaaau(raw_token)
+            is_live, name_or_err = bot.check_token()
+            if not is_live:
+                print(f"[!] Token nhập vào bị lỗi ({name_or_err}).")
+
+        if not is_live and raw_cookie:
+            print("[*] Đang lấy Token từ Cookie...")
+            ok, msg = bot.login_with_cookie(raw_cookie)
+            if ok:
+                is_live, name_or_err = bot.check_token()
+            else:
+                name_or_err = msg
+
+        if not is_live and raw_uid and raw_pass:
+            print(f"[*] Đang đăng nhập UID {raw_uid}...")
+            ok, msg = bot.login_with_account(raw_uid, raw_pass, raw_2fa)
+            if ok:
+                is_live, name_or_err = bot.check_token()
+            else:
+                name_or_err = msg
+
+        if not is_live:
+            print(f"[-] Đăng nhập thất bại: {name_or_err}")
+        else:
+            print(f"[+] Via Live! UID: {bot.uid} | Tên: {name_or_err}")
+            print(f"[+] Token đang dùng: {bot.access_token[:35]}...")
+
+            for i in range(so_luong):
+                p_name = f"{custom_name} {i + 1}" if (custom_name and so_luong > 1) else (custom_name or bot.random_page_name())
+                print(f"\n[*] [{i + 1}/{so_luong}] Đang tạo Page: '{p_name}'...")
+
+                ok, page_info = bot.reg_page(page_name=p_name)
+                if ok and isinstance(page_info, dict):
+                    p_id = page_info.get("id", "")
+                    p_real_name = page_info.get("name", p_name)
+                    p_token = page_info.get("access_token", "")
+
+                    print(f"[SUCCESS] TẠO PAGE THÀNH CÔNG!")
+                    print(f"   -> Tên Page  : {p_real_name}")
+                    print(f"   -> Page ID   : {p_id}")
+                    if p_token:
+                        print(f"   -> Token Page: {p_token[:40]}...")
+
+                    if avatar_url and p_token:
+                        if bot.upload_page_avatar(p_token, avatar_url):
+                            print("   -> Đã cập nhật Avatar thành công!")
+
+                    save_line(SUCCESS_FILE, f"{bot.uid}|{p_id}|{p_real_name}|{p_token}|{bot.access_token}")
+                    print(f"   -> Đã lưu vào : {SUCCESS_FILE}")
+                else:
+                    print(f"[-] Tạo thất bại: {page_info}")
+                    break
+
+                if i + 1 < so_luong:
+                    print(f"[*] Nghỉ {delay_sec} giây trước khi tạo tiếp...")
+                    time.sleep(delay_sec)
+
+        tiep = input("\n[?] Bạn có muốn chạy tiếp tài khoản khác không? (y/n): ").strip().lower()
+        if tiep != "y":
+            break
+
+
+def run_batch_file_mode():
+    print("\n" + "=" * 65)
+    print("   CHẾ ĐỘ 2: CHẠY ĐA LUỒNG TỪ FILE ACCOUNTS.TXT")
+    print("=" * 65)
+
+    if not os.path.exists(ACCOUNTS_FILE):
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            f.write("# Dán mỗi dòng 1 tài khoản (Token, Cookie, Cookie|Token, hoặc UID|Pass|2FA)\n")
+        print(f"[!] Đã tạo file mẫu tại: {ACCOUNTS_FILE}")
+        print("[!] Hãy mở file đó, dán danh sách Token/Cookie vào rồi chạy lại!")
+        return
+
+    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
     if not lines:
-        print(f"[!] File '{CONFIG['INPUT_FILE']}' đang trống. Hãy thêm tài khoản vào trước khi chạy!")
-        exit(0)
+        print(f"[-] File {ACCOUNTS_FILE} đang trống! Hãy dán tài khoản vào trước.")
+        return
 
-    print(f"[*] Đã tải {len(lines)} tài khoản. Khởi chạy {CONFIG['MAX_THREADS']} luồng...")
+    print(f"[+] Đã tìm thấy {len(lines)} tài khoản trong file accounts.txt.")
+    threads_str = input("[1] Nhập số luồng chạy cùng lúc (Mặc định = 3)         : ").strip()
+    pages_str = input("[2] Số lượng Page muốn tạo mỗi acc (Mặc định = 4)      : ").strip()
+    delay_str = input("[3] Thời gian nghỉ giữa mỗi lần tạo - giây (Mặc định = 10): ").strip()
+    avatar_url = input("[4] Link ảnh Avatar (Nhấn Enter nếu không up Avatar)   : ").strip()
 
-    with ThreadPoolExecutor(max_workers=CONFIG["MAX_THREADS"]) as executor:
-        futures = [
-            executor.submit(worker_task, idx + 1, line, CONFIG)
-            for idx, line in enumerate(lines)
-        ]
+    config = {
+        "MAX_THREADS": int(threads_str) if threads_str.isdigit() else 3,
+        "PAGES_PER_ACC": int(pages_str) if pages_str.isdigit() else 4,
+        "DELAY_SEC": int(delay_str) if delay_str.isdigit() else 10,
+        "AVATAR_URL": avatar_url if avatar_url else None,
+        "DEFAULT_PROXY": None
+    }
+
+    print(f"\n[*] Đang khởi chạy {config['MAX_THREADS']} luồng...\n")
+    with ThreadPoolExecutor(max_workers=config["MAX_THREADS"]) as executor:
+        futures = [executor.submit(worker_task, idx + 1, line, config) for idx, line in enumerate(lines)]
         for future in as_completed(futures):
             try:
                 future.result()
-            except Exception as exc:
-                safe_print(f"[-] Lỗi ngoại lệ trong luồng: {exc}")
+            except Exception as e:
+                safe_print(f"[-] Lỗi luồng: {e}")
 
-    print("\n[=== HOÀN TẤT TOÀN BỘ QUÁ TRÌNH ===]")
-    print("-> Danh sách Page tạo thành công được lưu tại: success_pages.txt")
-    print("-> Danh sách Via lỗi được lưu tại            : failed_accounts.txt")
+    print("\n[=== ĐÃ CHẠY XONG TOÀN BỘ DANH SÁCH ===]")
+    print(f"-> Kết quả lưu tại: {SUCCESS_FILE}")
+
+
+def main():
+    os.system("cls" if os.name == "nt" else "clear")
+    print("=" * 65)
+    print("      TOOL REG PAGE PROFILE PLUS FULL API (TOKEN / COOKIE)")
+    print("=" * 65)
+    print("  [1] Nhập trực tiếp Token / Cookie trên màn hình CMD (Chạy lẻ)")
+    print("  [2] Chạy hàng loạt đa luồng từ file accounts.txt")
+    print("=" * 65)
+
+    choice = input("-> Chọn chế độ chạy (1 hoặc 2, mặc định là 1): ").strip()
+    if choice == "2":
+        run_batch_file_mode()
+    else:
+        run_interactive_mode()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Đã dừng chương trình.")
+    input("\nNhấn phím Enter để thoát...")
